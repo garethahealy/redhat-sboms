@@ -1,0 +1,8 @@
+---
+description: Project overview and conventions for redhat-sboms
+alwaysApply: true
+---
+
+# Project Overview
+
+Demo project to download SBOMs for Red Hat images
