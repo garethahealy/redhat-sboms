@@ -46,6 +46,8 @@ attestations are downloaded.
 For multi-arch images, --platform selects that arch so the SBOM includes
 packages. Without it, a multi-arch tag yields the index SBOM (images only).
 
+If the image has no attestations, the script warns and exits successfully.
+
 Options:
   -o, --output-dir DIR     Directory to write artifacts
                            (default: ./out/<image-slug>)
@@ -188,23 +190,29 @@ run_cosign_with_platform() {
 
   cmd=(cosign "$@")
   if [[ -z "$platform" ]]; then
-    "${cmd[@]}" "$digest_ref" >"$out_file"
-    return 0
+    err="$("${cmd[@]}" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
+  else
+    err="$("${cmd[@]}" --platform "$platform" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
+    if ((rc != 0)) && [[ "$err" == *"not a multiarch image"* ]]; then
+      warn "image is not a multi-arch index; retrying without --platform ${platform}"
+      : >"$out_file"
+      rc=0
+      err="$("${cmd[@]}" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
+    fi
   fi
 
-  err="$("${cmd[@]}" --platform "$platform" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
-  if ((rc == 0)); then
-    return 0
-  fi
-  if [[ "$err" == *"not a multiarch image"* ]]; then
-    warn "image is not a multi-arch index; retrying without --platform ${platform}"
-    : >"$out_file"
-    "${cmd[@]}" "$digest_ref" >"$out_file"
-    return 0
-  fi
-
-  printf '%s\n' "$err" >&2
+  COSIGN_ERR="$err"
   return "$rc"
+}
+
+# Cosign exits non-zero when the attestation tag is absent. An empty file
+# plus one of these messages is "nothing to download", not a failed download.
+missing_attestations() {
+  local err="$1"
+  local att_file="$2"
+
+  [[ -s "$att_file" ]] && return 1
+  [[ "$err" == *[Aa]ttestation* || "$err" == *MANIFEST_UNKNOWN* || "$err" == *manifest\ unknown* ]]
 }
 
 # Predicate type from a Cosign DSSE envelope (JSONL line).
@@ -291,9 +299,19 @@ download_attestations() {
   local digest_ref="$1"
   local platform="$2"
   local att_file="$3"
+  local rc=0
 
   log "downloading attestations for ${digest_ref}"
-  run_cosign_with_platform "$platform" "$att_file" "$digest_ref" download attestation
+  run_cosign_with_platform "$platform" "$att_file" "$digest_ref" download attestation || rc=$?
+  if ((rc == 0)); then
+    return 0
+  fi
+  if missing_attestations "$COSIGN_ERR" "$att_file"; then
+    : >"$att_file"
+    return 0
+  fi
+  printf '%s\n' "$COSIGN_ERR" >&2
+  return "$rc"
 }
 
 sbom_arch() {
@@ -546,7 +564,8 @@ main() {
   download_attestations "$digest_ref" "$PLATFORM" "$att_file"
 
   if [[ ! -s "$att_file" ]]; then
-    die "no attestations written for ${IMAGE}"
+    warn "no attestations found for ${IMAGE}"
+    return 0
   fi
 
   count="$(grep -c . "$att_file" || true)"

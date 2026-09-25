@@ -1,0 +1,7 @@
+docker:
+  registry.access.redhat.com:
+    use-sigstore-attachments: true
+  registry.redhat.io:
+    use-sigstore-attachments: true
+  quay.io:
+    use-sigstore-attachments: true

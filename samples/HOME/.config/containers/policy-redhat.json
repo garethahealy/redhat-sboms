@@ -1,0 +1,29 @@
+{
+  "default": [
+    {
+      "type": "reject"
+    }
+  ],
+  "transports": {
+    "docker": {
+      "registry.access.redhat.com": [
+        {
+          "type": "sigstoreSigned",
+          "keyPath": "/home/runner/redhat-sigstore.pub"
+        }
+      ],
+      "registry.redhat.io": [
+        {
+          "type": "sigstoreSigned",
+          "keyPath": "/home/runner/redhat-sigstore.pub"
+        }
+      ],
+      "quay.io": [
+        {
+          "type": "sigstoreSigned",
+          "keyPath": "/home/runner/redhat-sigstore.pub"
+        }
+      ]
+    }
+  }
+}
