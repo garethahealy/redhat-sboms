@@ -2,6 +2,9 @@
 # Download and verify in-toto attestations for a container image with cosign,
 # then extract any embedded SBOMs. Konflux images typically attach SPDX (and
 # SLSA provenance). Older OSBS images wrap CycloneDX in predicate.Data.
+# If the attestations do not contain an SBOM, fall back to the Cosign SBOM
+# attachment (`cosign download sbom`, the .sbom tag). That attachment is not
+# signature-verified.
 
 set -euo pipefail
 
@@ -46,7 +49,9 @@ attestations are downloaded.
 For multi-arch images, --platform selects that arch so the SBOM includes
 packages. Without it, a multi-arch tag yields the index SBOM (images only).
 
-If the image has no attestations, the script warns and exits successfully.
+If the attestations do not contain an SBOM, the script falls back to
+cosign download sbom. If the image has neither attestations nor an SBOM
+attachment, the script warns and exits successfully.
 
 Options:
   -o, --output-dir DIR     Directory to write artifacts
@@ -215,6 +220,17 @@ missing_attestations() {
   [[ "$err" == *[Aa]ttestation* || "$err" == *MANIFEST_UNKNOWN* || "$err" == *manifest\ unknown* ]]
 }
 
+# Cosign exits non-zero when the .sbom tag is absent.
+missing_sbom() {
+  local err="$1"
+  local sbom_file="$2"
+  local err_lc
+
+  [[ -s "$sbom_file" ]] && return 1
+  err_lc="$(printf '%s' "$err" | tr '[:upper:]' '[:lower:]')"
+  [[ "$err_lc" == *no\ sbom* || "$err_lc" == *manifest_unknown* || "$err_lc" == *manifest\ unknown* ]]
+}
+
 # Predicate type from a Cosign DSSE envelope (JSONL line).
 attestation_predicate_type() {
   local line="$1"
@@ -314,6 +330,43 @@ download_attestations() {
   return "$rc"
 }
 
+# Cosign SBOM attachment for images that publish SPDX on the .sbom tag
+# instead of inside an in-toto attestation.
+download_sbom_attachment() {
+  local digest_ref="$1"
+  local platform="$2"
+  local dest_dir="$3"
+  local tmp sbom_file rc=0
+
+  tmp="$(mktemp)"
+  log "no SBOM in attestations; downloading SBOM attachment for ${digest_ref}"
+  run_cosign_with_platform "$platform" "$tmp" "$digest_ref" download sbom || rc=$?
+  if ((rc != 0)); then
+    if missing_sbom "$COSIGN_ERR" "$tmp"; then
+      warn "no SBOM attachment found for ${IMAGE}"
+      rm -f "$tmp"
+      return 0
+    fi
+    printf '%s\n' "$COSIGN_ERR" >&2
+    rm -f "$tmp"
+    return "$rc"
+  fi
+
+  if [[ ! -s "$tmp" ]] || ! is_sbom_document <"$tmp"; then
+    cp "$tmp" "${dest_dir}/sbom-00-unknown.txt"
+    warn "SBOM attachment is not CycloneDX or SPDX JSON; wrote ${dest_dir}/sbom-00-unknown.txt"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  sbom_file="${dest_dir}/$(sbom_filename 0 <"$tmp")"
+  jq . <"$tmp" >"$sbom_file"
+  rm -f "$tmp"
+  SBOM_COUNT=$((SBOM_COUNT + 1))
+  warn "SBOM attachment is not signed as an in-toto attestation; saved without signature verification"
+  log "wrote ${sbom_file}"
+}
+
 sbom_arch() {
   jq -r '
     [
@@ -339,11 +392,17 @@ sbom_arch() {
   '
 }
 
-sbom_filename() {
-  local sbom="$1"
-  local index="$2"
-  local format arch version
+# CycloneDX JSON or SPDX JSON. Reads the document on stdin.
+is_sbom_document() {
+  jq -e '.bomFormat == "CycloneDX" or (.spdxVersion | type == "string")' >/dev/null 2>&1
+}
 
+# Reads the SBOM JSON on stdin. index is the filename sequence number.
+sbom_filename() {
+  local index="$1"
+  local sbom format arch version
+
+  sbom="$(cat)"
   format="$(jq -r '.bomFormat // .spdxVersion // empty' <<<"$sbom")"
   arch="$(sbom_arch <<<"$sbom")"
 
@@ -437,10 +496,11 @@ extract_one_attestation() {
     sbom="$data"
   fi
 
-  if jq -e '.bomFormat == "CycloneDX" or (.spdxVersion | type == "string")' >/dev/null 2>&1 <<<"$sbom"; then
-    sbom_file="${dest_dir}/$(sbom_filename "$sbom" "$index")"
+  if is_sbom_document <<<"$sbom"; then
+    sbom_file="${dest_dir}/$(sbom_filename "$index" <<<"$sbom")"
     jq . <<<"$sbom" >"$sbom_file"
     log "wrote ${sbom_file}"
+    SBOM_COUNT=$((SBOM_COUNT + 1))
   elif [[ -n "$data" ]]; then
     printf '%s\n' "$data" >"${att_dir}/predicate-${padded}-data.txt"
     log "wrote ${att_dir}/predicate-${padded}-data.txt"
@@ -529,6 +589,7 @@ parse_args() {
 
 main() {
   local digest_ref att_dir att_file count
+  SBOM_COUNT=0
 
   parse_args "$@"
 
@@ -563,17 +624,18 @@ main() {
   att_file="${att_dir}/attestations.jsonl"
   download_attestations "$digest_ref" "$PLATFORM" "$att_file"
 
-  if [[ ! -s "$att_file" ]]; then
+  if [[ -s "$att_file" ]]; then
+    count="$(grep -c . "$att_file" || true)"
+    log "wrote ${att_file} (${count} attestation(s))"
+    verify_attestations "$KEY" "$att_file"
+    extract_attestations "$OUTPUT_DIR" "$att_dir" "$att_file"
+  else
     warn "no attestations found for ${IMAGE}"
-    return 0
   fi
 
-  count="$(grep -c . "$att_file" || true)"
-  log "wrote ${att_file} (${count} attestation(s))"
-
-  verify_attestations "$KEY" "$att_file"
-
-  extract_attestations "$OUTPUT_DIR" "$att_dir" "$att_file"
+  if ((SBOM_COUNT == 0)); then
+    download_sbom_attachment "$digest_ref" "$PLATFORM" "$OUTPUT_DIR"
+  fi
   printf '\n'
 }
 

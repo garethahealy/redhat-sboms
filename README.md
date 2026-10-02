@@ -35,6 +35,7 @@ After the tag is resolved to a digest, the script:
 1. Lists referrers with `oras discover`
 2. Verifies the image signature with `cosign` and `redhat-sigstore.pub`
 3. Downloads attestations and verifies SPDX/CycloneDX envelopes with the same key
+4. If those attestations contain no SBOM, downloads the Cosign SBOM attachment (`cosign download sbom`). That attachment is not signature-verified
 
 SLSA provenance envelopes are kept but not verified. Those are signed by Konflux Tekton Chains with a different key.
 
