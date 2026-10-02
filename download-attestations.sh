@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 # Download and verify in-toto attestations for a container image with cosign,
-# then extract any embedded SBOMs. Konflux images typically attach SPDX (and
-# SLSA provenance). Older OSBS images wrap CycloneDX in predicate.Data.
-# If the attestations do not contain an SBOM, fall back to the Cosign SBOM
-# attachment (`cosign download sbom`, the .sbom tag). That attachment is not
-# signature-verified.
+# then extract any embedded SBOMs. When those attestations contain no SPDX or
+# CycloneDX document, download the Cosign SBOM attachment. See usage().
 
 set -euo pipefail
 
@@ -30,34 +27,53 @@ usage() {
   cat <<EOF
 Usage: ${PROG_NAME} [options] <image>
 
-Download and verify attestations for a container image, then write them under
-the output directory. Envelopes, payloads, and predicates go in att/. Extracted
-SBOMs are written at the output directory root.
+Resolve an image tag to a digest, verify its signature, and write an SBOM.
+SBOMs are written as sbom-NN-<arch>-spdx.json or
+sbom-NN-<arch>-cdx-<version>.json in the output directory. Attestation
+envelopes, payloads, and predicates go in att/.
 
-Attestations.jsonl is verified with cosign and Red Hat's Sigstore public key
-(redhat-sigstore.pub). SLSA provenance envelopes are kept but not verified;
-those are signed by Konflux Tekton Chains with a different key.
+The tag is resolved to a digest with oras. --platform is applied later, when
+an attestation or SBOM attachment is downloaded. Referrers are listed with
+oras discover. An empty referrer list is normal: registry.redhat.io publishes
+these objects as Cosign tags. The image signature is verified with cosign and
+the public key. Transparency-log checks are skipped.
 
-Examples:
-  ${PROG_NAME} --platform linux/amd64 registry.redhat.io/ubi9/ubi:9.8
-  ${PROG_NAME} registry.redhat.io/openshift-gitops-1/gitops-operator-bundle:v1.21.3-1
+SBOM sources, in order. Every SPDX or CycloneDX document in the attestations
+is written. The attachment is downloaded only when that count is zero.
 
-The image tag is resolved to a digest with oras. Referrers are listed with
-oras discover, then the image signature is verified with cosign before
-attestations are downloaded.
+  Attestation
+    cosign download attestation (tag sha256-<digest>.att).
+    A Konflux SPDX statement uses predicateType https://spdx.dev/Document
+    and the predicate is the SBOM. An older OSBS attestation carries
+    CycloneDX in predicate.Data.
+    SPDX and CycloneDX envelopes are verified with the public key. The script
+    exits if at least one of those envelopes was checked and none verified.
+    SLSA provenance (https://slsa.dev/provenance/) is stored under att/ and
+    skipped. Konflux Tekton Chains signs it with a different key.
+    Example:
+      ${PROG_NAME} registry.redhat.io/openshift-gitops-1/gitops-operator-bundle:v1.21.3-1
 
-For multi-arch images, --platform selects that arch so the SBOM includes
-packages. Without it, a multi-arch tag yields the index SBOM (images only).
+  SBOM attachment
+    cosign download sbom (tag sha256-<digest>.sbom).
+    The body is saved when it is SPDX or CycloneDX JSON, as sbom-00-<arch>-*.json.
+    The attachment has no in-toto signature, so the script warns that it was
+    saved without signature verification.
+    Example:
+      ${PROG_NAME} --platform linux/amd64 registry.redhat.io/ubi9/ubi:9.8
 
-If the attestations do not contain an SBOM, the script falls back to
-cosign download sbom. If the image has neither attestations nor an SBOM
-attachment, the script warns and exits successfully.
+For a multi-arch image, --platform is passed to both downloads and selects
+that architecture, so the SBOM includes packages. Without --platform, the
+index SBOM lists the index and its per-architecture images. When cosign
+reports that the digest is not a multi-arch image, the download is retried
+without --platform.
+
+If the image has no attestations and no SBOM attachment, the script warns
+and exits successfully.
 
 Options:
   -o, --output-dir DIR     Directory to write artifacts
                            (default: ./out/<image-slug>)
-  -p, --platform PLATFORM  Select one platform from a multi-arch index
-                           (e.g. linux/amd64)
+  -p, --platform PLATFORM  Platform for both downloads (e.g. linux/amd64)
   -k, --key FILE           Cosign public key
                            (default: redhat-sigstore.pub next to this script)
   -h, --help               Show this help
@@ -94,6 +110,7 @@ image_repository() {
   fi
 }
 
+# Output-directory slug: strip a URL scheme and replace / : @ with _.
 image_slug() {
   local image="$1"
   image="${image#https://}"
@@ -133,9 +150,11 @@ predicate_type_slug() {
   printf '%s\n' "${slug:-unknown}"
 }
 
-# Resolve a tag (or digest) to image@sha256:...
-# Do not pass --platform here: that pins a child manifest, and cosign then
-# errors with "specified reference is not a multiarch image".
+# Resolve a tag or digest to image@sha256:...
+# Stay on the index digest. --platform is applied later by
+# run_cosign_with_platform, when the attestation or SBOM attachment is
+# downloaded. Passing it here pins a child manifest, and cosign then reports
+# that the reference is not a multi-arch image.
 resolve_digest_ref() {
   local image="$1"
   local out ref digest repo
@@ -167,6 +186,9 @@ resolve_digest_ref() {
   printf '%s\n' "$ref"
 }
 
+# List OCI referrers for the resolved digest. An empty list is normal on
+# registry.redhat.io. Attestations and SBOM attachments are read from the
+# Cosign tags below; this listing does not select them.
 discover_referrers() {
   local digest_ref="$1"
 
@@ -174,6 +196,8 @@ discover_referrers() {
   oras discover --format tree "$digest_ref"
 }
 
+# Verify the image signature with the public key. Transparency-log checks
+# are skipped.
 verify_image() {
   local digest_ref="$1"
   local key="$2"
@@ -245,8 +269,8 @@ attestation_predicate_type() {
   printf '%s\n' "${ptype:-unknown}"
 }
 
-# Konflux SLSA provenance is signed with a per-cluster ECDSA key, not
-# redhat-sigstore.pub.
+# True for https://slsa.dev/provenance/*. Konflux Tekton Chains signs these
+# with a different key, so verification is skipped.
 is_slsa_provenance() {
   [[ "${1:-}" == https://slsa.dev/provenance/* ]]
 }
@@ -272,6 +296,9 @@ verify_dsse_envelope() {
   return 1
 }
 
+# Verify SPDX and CycloneDX envelopes in attestations.jsonl with the public
+# key. SLSA provenance is stored and skipped. Exit when at least one envelope
+# was checked and none verified. An all-SLSA file warns and returns success.
 verify_attestations() {
   local key="$1"
   local att_file="$2"
@@ -311,6 +338,9 @@ verify_attestations() {
   ((verified > 0)) || die "none of the attestations verified with ${key}"
 }
 
+# Attestation source: cosign download attestation (tag sha256-<digest>.att).
+# One DSSE envelope per line in the output file. A missing tag leaves that
+# file empty and returns success. Other cosign errors are returned.
 download_attestations() {
   local digest_ref="$1"
   local platform="$2"
@@ -330,8 +360,12 @@ download_attestations() {
   return "$rc"
 }
 
-# Cosign SBOM attachment for images that publish SPDX on the .sbom tag
-# instead of inside an in-toto attestation.
+# SBOM attachment source: cosign download sbom (tag sha256-<digest>.sbom).
+# Called when SBOM_COUNT is still zero after attestation extraction.
+# SPDX or CycloneDX JSON is written as sbom-00-<arch>-*.json. Any other body
+# is written as sbom-00-unknown.txt. A missing tag warns and returns success.
+# The attachment is not an in-toto envelope, so it is saved without signature
+# verification.
 download_sbom_attachment() {
   local digest_ref="$1"
   local platform="$2"
@@ -367,6 +401,8 @@ download_sbom_attachment() {
   log "wrote ${sbom_file}"
 }
 
+# Majority package architecture from CycloneDX purls (arch=) or SPDX
+# externalRefs. noarch is ignored. This value is the <arch> in SBOM filenames.
 sbom_arch() {
   jq -r '
     [
@@ -433,6 +469,11 @@ write_json_or_raw() {
   return 1
 }
 
+# Write one DSSE envelope, its statement, and its predicate under att/.
+# When predicate.Data or predicate.data is non-empty, that value is checked
+# as the SBOM. Otherwise the predicate itself is checked. An SPDX or
+# CycloneDX document is written at the output root and increments SBOM_COUNT.
+# Other Data is stored as att/predicate-NN-data.txt.
 extract_one_attestation() {
   local dest_dir="$1"
   local att_dir="$2"
@@ -507,6 +548,8 @@ extract_one_attestation() {
   fi
 }
 
+# Walk attestations.jsonl. Each non-empty line is one envelope. SBOM_COUNT
+# is the number of SPDX or CycloneDX documents written from those lines.
 extract_attestations() {
   local dest_dir="$1"
   local att_dir="$2"

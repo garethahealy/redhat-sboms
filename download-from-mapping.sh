@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Read an oc-mirror v2 dry-run mapping.txt and download attestations for each
-# selected source image. Defaults to registry.redhat.io and quay.io.
+# Read an oc-mirror v2 dry-run mapping.txt and run download-attestations.sh
+# for each selected source image. That script tries an in-toto attestation
+# SBOM, then a Cosign SBOM attachment. See download-attestations.sh --help.
 
 set -euo pipefail
 
@@ -24,17 +25,57 @@ usage() {
   cat <<EOF
 Usage: ${PROG_NAME} [options] [mapping.txt]
 
-Parse an oc-mirror v2 mapping.txt and run download-attestations.sh for each
-selected source (the reference to the left of '=').
+Read an oc-mirror v2 mapping.txt and run download-attestations.sh for each
+selected source (the reference to the left of '='). The destination on the
+right of '=' is ignored.
+
+download-attestations.sh tries two SBOM sources for each image, in order.
+Every SPDX or CycloneDX document in the attestations is written. The
+attachment is downloaded only when that count is zero.
+
+  Attestation
+    cosign download attestation (tag sha256-<digest>.att).
+    A Konflux SPDX statement uses predicateType https://spdx.dev/Document
+    and the predicate is the SBOM. An older OSBS attestation carries
+    CycloneDX in predicate.Data.
+    SPDX and CycloneDX envelopes are verified with the public key. The child
+    script exits if at least one of those envelopes was checked and none
+    verified. SLSA provenance (https://slsa.dev/provenance/) is stored under
+    att/ and skipped. Konflux Tekton Chains signs it with a different key.
+
+  SBOM attachment
+    cosign download sbom (tag sha256-<digest>.sbom).
+    The body is saved when it is SPDX or CycloneDX JSON, as
+    sbom-00-<arch>-*.json. The attachment has no in-toto signature, so the
+    child script warns that it was saved without signature verification.
+
+--platform is forwarded and passed to both of those downloads. For a
+multi-arch image it selects that architecture, so the SBOM includes
+packages. Without --platform, the index SBOM lists the index and its
+per-architecture images. When the resolved digest is already single-arch,
+the child script retries without --platform.
+
+The tag is resolved to a digest before --platform is applied. An empty
+oras discover list is normal. The image signature is verified with the
+public key, and transparency-log checks are skipped. If an image has no
+attestations and no SBOM attachment, the child script warns and exits
+successfully, which this script treats as success.
 
 By default the source registries are registry.redhat.io and quay.io. Pass
---source more than once to use a different set. The destination on the right
-of '=' is ignored.
+--source more than once to replace that set. The default mapping file is
+oc-mirror-data/working-dir/dry-run/mapping.txt.
 
-A source of name:tag@sha256:digest is a platform manifest from a multi-arch
-image. When the same name:tag is also listed, that platform line is skipped so
-one image set entry stays one download. Pass --platform to select an
-architecture of that image.
+Blank lines and lines starting with # are skipped. A line without '=' is
+an error.
+
+A source of name:tag@sha256:digest is one platform of a manifest list. When
+the same name:tag is also listed, that platform line is skipped so one image
+set entry stays one download. When the name:tag line is absent, the platform
+line is kept as repository@sha256:digest (the tag is removed). Duplicate
+references are skipped.
+
+Each image is still downloaded when an earlier image fails. This script
+exits non-zero when any download fails.
 
 Examples:
   ${PROG_NAME} oc-mirror-data/working-dir/dry-run/mapping.txt
@@ -44,7 +85,7 @@ Examples:
 Options:
   -s, --source REGISTRY    Source registry hostname to include (repeatable).
                            Replaces the default set when given.
-  -p, --platform PLATFORM  Platform forwarded to download-attestations.sh
+  -p, --platform PLATFORM  Platform forwarded to both SBOM downloads
   -k, --key FILE           Cosign public key forwarded to download-attestations.sh
   -n, --print              Print the image references and do not download
   -h, --help               Show this help
@@ -65,6 +106,8 @@ source_host() {
   printf '%s\n' "${raw%%/*}"
 }
 
+# True when host is one of the registries selected by --source, or the
+# default set registry.redhat.io and quay.io.
 source_selected() {
   local host="$1"
   local registry
@@ -174,7 +217,9 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   source_selected "$(source_host "$source")" || continue
   raw_sources+=("$source")
 
-  # name:tag, with no digest, is the image itself. Platform lines hang off it.
+  # name:tag, with no digest, is the image itself. A later
+  # name:tag@sha256:digest line for this same reference is one platform of
+  # that manifest list and is skipped.
   if [[ "${source#docker://}" != *@sha256:* ]]; then
     parents+="${source#docker://} "
   fi
@@ -185,7 +230,9 @@ seen=" "
 
 for source in "${raw_sources[@]}"; do
   bare="${source#docker://}"
-  # name:tag@sha256:digest is one platform of a manifest list, not another image.
+  # Platform line whose name:tag parent was also listed. Skip it.
+  # A platform line with no parent is kept; source_image_ref drops the tag
+  # and leaves repository@sha256:digest.
   if [[ "$bare" == *:*@sha256:* ]]; then
     parent="${bare%%@*}"
     [[ "$parents" == *" ${parent} "* ]] && continue
@@ -208,6 +255,9 @@ if [[ "$PRINT_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
+# Forward --platform and --key. download-attestations.sh tries the
+# attestation SBOM, then the Cosign SBOM attachment. Keep going after a
+# failure so one image does not hide the rest.
 failed=0
 for ref in "${images[@]}"; do
   args=("$DOWNLOAD_SCRIPT")
@@ -219,7 +269,7 @@ for ref in "${images[@]}"; do
   fi
   args+=("$ref")
 
-  log "downloading attestations for ${ref}"
+  log "downloading ${ref}"
   if ! "${args[@]}"; then
     printf 'error: download failed for %s\n' "$ref" >&2
     failed=$((failed + 1))
