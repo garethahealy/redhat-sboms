@@ -41,42 +41,7 @@ jobs:
         run: ./run.sh
 
       - name: Validate SBOMs
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-
-          slug() {
-            local image="$1"
-            image="${image#https://}"
-            image="${image#http://}"
-            image="${image//\//_}"
-            image="${image//:/_}"
-            image="${image//@/_}"
-            printf '%s\n' "$image"
-          }
-
-          failed=0
-          found=0
-          while IFS= read -r line; do
-            read -r -a args <<<"${line}"
-            image="${args[${#args[@]} - 1]}"
-            dir="./out/$(slug "${image}")"
-            sboms=("${dir}"/sbom-*.json)
-            found=$((found + 1))
-            if ((${#sboms[@]} == 0)); then
-              echo "error: no SBOM for ${image} (looked in ${dir})" >&2
-              failed=1
-              continue
-            fi
-            echo "ok ${image} (${#sboms[@]} SBOM(s))"
-            printf '  %s\n' "${sboms[@]##*/}"
-          done < <(grep -E '^[[:space:]]*\./download-attestations\.sh' run.sh || true)
-
-          if ((found == 0)); then
-            echo "error: no download-attestations.sh invocations in run.sh" >&2
-            exit 1
-          fi
-          exit "${failed}"
+        run: .github/validate-sboms.sh
 
       - name: Archive out/
         if: always()
