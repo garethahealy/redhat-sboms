@@ -5,6 +5,10 @@
 
 set -euo pipefail
 
+# Keep the script's stdout. run_cli prints the command there even when the
+# command's own stdout or stderr is redirected or captured.
+exec 3>&1
+
 readonly PROG_NAME="${0##*/}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
@@ -23,6 +27,14 @@ log() {
   printf '%s\n' "$*"
 }
 
+# Print a CLI command, then run it.
+run_cli() {
+  printf '+' >&3
+  printf ' %q' "$@" >&3
+  printf '\n' >&3
+  "$@"
+}
+
 usage() {
   cat <<EOF
 Usage: ${PROG_NAME} [options] <image>
@@ -32,11 +44,11 @@ SBOMs are written as sbom-NN-<arch>-spdx.json or
 sbom-NN-<arch>-cdx-<version>.json in the output directory. Attestation
 envelopes, payloads, and predicates go in att/.
 
-The tag is resolved to a digest with oras. --platform is applied later, when
-an attestation or SBOM attachment is downloaded. Referrers are listed with
-oras discover. An empty referrer list is normal: registry.redhat.io publishes
-these objects as Cosign tags. The image signature is verified with cosign and
-the public key. Transparency-log checks are skipped.
+The tag is resolved to a digest with oras. When --platform is set, oras
+selects that platform's manifest. Referrers are listed with oras discover.
+An empty referrer list is normal: registry.redhat.io publishes these objects
+as Cosign tags. The image signature is verified with cosign and the public
+key, unless --skip-verify-image is set. Transparency-log checks are skipped.
 
 SBOM sources, in order. Every SPDX or CycloneDX document in the attestations
 is written. The attachment is downloaded only when that count is zero.
@@ -46,26 +58,30 @@ is written. The attachment is downloaded only when that count is zero.
     A Konflux SPDX statement uses predicateType https://spdx.dev/Document
     and the predicate is the SBOM. An older OSBS attestation carries
     CycloneDX in predicate.Data.
-    SPDX and CycloneDX envelopes are verified with the public key. The script
-    exits if at least one of those envelopes was checked and none verified.
+    SPDX and CycloneDX envelopes are verified with the public key, unless
+    --skip-verify-attestation is set. The script warns if at least one of
+    those envelopes was checked and none verified.
     SLSA provenance (https://slsa.dev/provenance/) is stored under att/ and
     skipped. Konflux Tekton Chains signs it with a different key.
     Example:
+      ${PROG_NAME} --platform linux/amd64 registry.redhat.io/ubi9/ubi:9.8
+      The amd64 manifest's attestations include an SPDX document, which is
+      the SBOM, and SLSA provenance.
       ${PROG_NAME} registry.redhat.io/openshift-gitops-1/gitops-operator-bundle:v1.21.3-1
 
   SBOM attachment
     cosign download sbom (tag sha256-<digest>.sbom).
+    Used when no attestation contains an SPDX or CycloneDX document.
     The body is saved when it is SPDX or CycloneDX JSON, as sbom-00-<arch>-*.json.
     The attachment has no in-toto signature, so the script warns that it was
     saved without signature verification.
-    Example:
-      ${PROG_NAME} --platform linux/amd64 registry.redhat.io/ubi9/ubi:9.8
 
-For a multi-arch image, --platform is passed to both downloads and selects
-that architecture, so the SBOM includes packages. Without --platform, the
-index SBOM lists the index and its per-architecture images. When cosign
-reports that the digest is not a multi-arch image, the download is retried
-without --platform.
+For a multi-arch image, --platform selects that architecture's manifest when
+the tag is resolved, so the SBOM is the one for that architecture. Downloads
+then use that digest. Because the digest is no longer an index, cosign is
+retried without --platform. Without --platform, resolution stays on the tag
+digest. When a single-arch image does not match --platform, resolution is
+retried without it.
 
 If the image has no attestations and no SBOM attachment, the script warns
 and exits successfully.
@@ -73,9 +89,12 @@ and exits successfully.
 Options:
   -o, --output-dir DIR     Directory to write artifacts
                            (default: ./out/<image-slug>)
-  -p, --platform PLATFORM  Platform for both downloads (e.g. linux/amd64)
+  -p, --platform PLATFORM  Platform manifest to resolve (e.g. linux/amd64)
   -k, --key FILE           Cosign public key
                            (default: redhat-sigstore.pub next to this script)
+      --skip-verify-image  Skip image signature verification
+      --skip-verify-attestation
+                           Skip attestation signature verification
   -h, --help               Show this help
 EOF
 }
@@ -151,32 +170,60 @@ predicate_type_slug() {
 }
 
 # Resolve a tag or digest to image@sha256:...
-# Stay on the index digest. --platform is applied later by
-# run_cosign_with_platform, when the attestation or SBOM attachment is
-# downloaded. Passing it here pins a child manifest, and cosign then reports
-# that the reference is not a multi-arch image.
+# When platform is set, oras --platform selects that manifest. An image whose
+# platform does not match is resolved again without --platform.
 resolve_digest_ref() {
   local image="$1"
-  local out ref digest repo
+  local platform="${2:-}"
+  local out err_file ref digest repo rc
+  local -a fetch_cmd discover_cmd
 
-  if [[ "$image" == *@sha256:* ]]; then
+  if [[ "$image" == *@sha256:* && -z "$platform" ]]; then
     printf '%s\n' "$image"
     return 0
   fi
 
-  if out="$(oras manifest fetch --descriptor "$image" 2>/dev/null)" && jq -e . >/dev/null 2>&1 <<<"$out"; then
+  err_file="$(mktemp)"
+  fetch_cmd=(oras manifest fetch --descriptor)
+  if [[ -n "$platform" ]]; then
+    fetch_cmd+=(--platform "$platform")
+  fi
+  rc=0
+  out="$(run_cli "${fetch_cmd[@]}" "$image" 2>"$err_file")" || rc=$?
+  if ((rc == 0)) && jq -e . >/dev/null 2>&1 <<<"$out"; then
     digest="$(jq -r '.digest // empty' <<<"$out")"
     if [[ "$digest" == sha256:* ]]; then
+      rm -f "$err_file"
       repo="$(image_repository "$image")"
       printf '%s@%s\n' "$repo" "$digest"
       return 0
     fi
   fi
+  if [[ -n "$platform" ]] && grep -q 'does not match target platform' "$err_file"; then
+    warn "image platform does not match ${platform}; resolving without --platform"
+    rm -f "$err_file"
+    resolve_digest_ref "$image"
+    return
+  fi
 
   # Older oras JSON from discover has no subject reference; the tree view prints it first.
-  if ! out="$(oras discover --format tree "$image")"; then
+  discover_cmd=(oras discover --format tree)
+  if [[ -n "$platform" ]]; then
+    discover_cmd+=(--platform "$platform")
+  fi
+  rc=0
+  out="$(run_cli "${discover_cmd[@]}" "$image" 2>"$err_file")" || rc=$?
+  if ((rc != 0)); then
+    if [[ -n "$platform" ]] && grep -q 'does not match target platform' "$err_file"; then
+      warn "image platform does not match ${platform}; resolving without --platform"
+      rm -f "$err_file"
+      resolve_digest_ref "$image"
+      return
+    fi
+    rm -f "$err_file"
     die "failed to resolve digest for ${image}"
   fi
+  rm -f "$err_file"
 
   ref="$(printf '%s\n' "$out" | awk '/@sha256:/{gsub(/^[[:space:]]+/, ""); print; exit}')"
   if [[ -z "$ref" ]]; then
@@ -193,7 +240,7 @@ discover_referrers() {
   local digest_ref="$1"
 
   log "discovering referrers for ${digest_ref}"
-  oras discover --format tree "$digest_ref"
+  run_cli oras discover --format tree "$digest_ref"
 }
 
 # Verify the image signature with the public key. Transparency-log checks
@@ -203,11 +250,13 @@ verify_image() {
   local key="$2"
 
   log "verifying image ${digest_ref} with ${key}"
-  cosign verify --key "$key" --insecure-ignore-tlog=true "$digest_ref" >/dev/null
+  run_cli cosign verify --key "$key" --insecure-ignore-tlog=true "$digest_ref" >/dev/null
 }
 
-# Run cosign with optional --platform. If the digest is already a single-arch
-# image, retry without --platform.
+# Run cosign with optional --platform. After oras --platform, the digest is
+# that platform's manifest, so it is not an index. Cosign then reports that
+# and the command is retried without --platform. The same retry covers an
+# image that was already single-arch.
 run_cosign_with_platform() {
   local platform="$1"
   local out_file="$2"
@@ -219,14 +268,14 @@ run_cosign_with_platform() {
 
   cmd=(cosign "$@")
   if [[ -z "$platform" ]]; then
-    err="$("${cmd[@]}" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
+    err="$(run_cli "${cmd[@]}" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
   else
-    err="$("${cmd[@]}" --platform "$platform" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
+    err="$(run_cli "${cmd[@]}" --platform "$platform" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
     if ((rc != 0)) && [[ "$err" == *"not a multiarch image"* ]]; then
-      warn "image is not a multi-arch index; retrying without --platform ${platform}"
+      log "digest is not a multi-arch index; retrying without --platform ${platform}"
       : >"$out_file"
       rc=0
-      err="$("${cmd[@]}" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
+      err="$(run_cli "${cmd[@]}" "$digest_ref" 2>&1 >"$out_file")" || rc=$?
     fi
   fi
 
@@ -283,7 +332,7 @@ verify_dsse_envelope() {
   local t
 
   for t in spdxjson cyclonedx custom; do
-    if cosign verify-blob-attestation \
+    if run_cli cosign verify-blob-attestation \
       --key "$key" \
       --signature "$envelope_file" \
       --type "$t" \
@@ -297,8 +346,9 @@ verify_dsse_envelope() {
 }
 
 # Verify SPDX and CycloneDX envelopes in attestations.jsonl with the public
-# key. SLSA provenance is stored and skipped. Exit when at least one envelope
-# was checked and none verified. An all-SLSA file warns and returns success.
+# key. SLSA provenance is stored and skipped. Warn when at least one envelope
+# was checked and none verified, then continue. An all-SLSA file warns and
+# returns success.
 verify_attestations() {
   local key="$1"
   local att_file="$2"
@@ -323,8 +373,6 @@ verify_attestations() {
     log "verifying attestation ${padded} (${ptype})"
     if verify_dsse_envelope "$tmp" "$key"; then
       verified=$((verified + 1))
-    else
-      warn "attestation ${padded} (${ptype}) did not verify with this key"
     fi
     index=$((index + 1))
   done <"$att_file"
@@ -335,7 +383,9 @@ verify_attestations() {
     warn "no attestations verified with ${key}; skipped ${skipped} SLSA provenance envelope(s)"
     return 0
   fi
-  ((verified > 0)) || die "none of the attestations verified with ${key}"
+  if ((verified == 0)); then
+    warn "none of the attestations verified with ${key}"
+  fi
 }
 
 # Attestation source: cosign download attestation (tag sha256-<digest>.att).
@@ -570,6 +620,8 @@ parse_args() {
   OUTPUT_DIR=""
   PLATFORM=""
   KEY=""
+  SKIP_VERIFY_IMAGE=0
+  SKIP_VERIFY_ATTESTATION=0
 
   while [[ $# -gt 0 ]]; do
     opt="$1"
@@ -592,6 +644,14 @@ parse_args() {
         require_option_value "$opt" "${2:-}"
         KEY="$2"
         shift 2
+        ;;
+      --skip-verify-image)
+        SKIP_VERIFY_IMAGE=1
+        shift
+        ;;
+      --skip-verify-attestation)
+        SKIP_VERIFY_ATTESTATION=1
+        shift
         ;;
       --)
         shift
@@ -658,11 +718,15 @@ main() {
   mkdir -p "$att_dir"
 
   log "resolving digest for ${IMAGE}"
-  digest_ref="$(resolve_digest_ref "$IMAGE")"
+  digest_ref="$(resolve_digest_ref "$IMAGE" "$PLATFORM")"
   log "using ${digest_ref}"
 
   discover_referrers "$digest_ref"
-  verify_image "$digest_ref" "$KEY"
+  if [[ "$SKIP_VERIFY_IMAGE" -eq 1 ]]; then
+    log "skipping image signature verification"
+  else
+    verify_image "$digest_ref" "$KEY"
+  fi
 
   att_file="${att_dir}/attestations.jsonl"
   download_attestations "$digest_ref" "$PLATFORM" "$att_file"
@@ -670,7 +734,11 @@ main() {
   if [[ -s "$att_file" ]]; then
     count="$(grep -c . "$att_file" || true)"
     log "wrote ${att_file} (${count} attestation(s))"
-    verify_attestations "$KEY" "$att_file"
+    if [[ "$SKIP_VERIFY_ATTESTATION" -eq 1 ]]; then
+      log "skipping attestation verification"
+    else
+      verify_attestations "$KEY" "$att_file"
+    fi
     extract_attestations "$OUTPUT_DIR" "$att_dir" "$att_file"
   else
     warn "no attestations found for ${IMAGE}"

@@ -26,11 +26,11 @@ wget -O redhat-sigstore.pub https://security.access.redhat.com/data/63405576.txt
 ./download-attestations.sh registry.redhat.io/openshift-gitops-1/gitops-operator-bundle:v1.21.3-1
 ```
 
-The first image is multi-arch and publishes its SBOM as a Cosign attachment. The second is single-arch and publishes its SBOM as an SPDX attestation.
+The first command selects the amd64 manifest of a multi-arch image. Its SBOM is the SPDX attestation on that manifest. The second image is single-arch and also publishes its SBOM as an SPDX attestation.
 
-`./download-attestations.sh --help` lists `--output-dir`, `--platform`, and `--key`.
+`./download-attestations.sh --help` lists `--output-dir`, `--platform`, `--key`, `--skip-verify-image`, and `--skip-verify-attestation`.
 
-`download-from-mapping.sh` runs that script for each selected source in an oc-mirror v2 `mapping.txt`. Both methods below apply to every image. `--platform` and `--key` are forwarded to both downloads.
+`download-from-mapping.sh` runs that script for each selected source in an oc-mirror v2 `mapping.txt`. Both methods below apply to every image. `--platform`, `--key`, `--skip-verify-image`, and `--skip-verify-attestation` are forwarded.
 
 ```bash
 ./download-from-mapping.sh --platform linux/amd64 oc-mirror-data/working-dir/dry-run/mapping.txt
@@ -40,7 +40,7 @@ The first image is multi-arch and publishes its SBOM as a Cosign attachment. The
 
 ## Methods
 
-The tag is resolved to a digest with `oras`. `--platform` is applied when an attestation or SBOM attachment is downloaded, so resolution stays on the index digest. Referrers are listed with `oras discover`. An empty referrer list is normal on `registry.redhat.io`, which publishes these objects as Cosign tags. The image signature is then verified with `cosign` and `redhat-sigstore.pub`. Transparency-log checks are skipped.
+The tag is resolved to a digest with `oras`. When `--platform` is set, oras selects that platform's manifest. Referrers are listed with `oras discover`. An empty referrer list is normal on `registry.redhat.io`, which publishes these objects as Cosign tags. The image signature is then verified with `cosign` and `redhat-sigstore.pub`, unless `--skip-verify-image` is set. Transparency-log checks are skipped.
 
 Every SPDX or CycloneDX document in the attestations is written. The attachment is downloaded only when that count is zero.
 
@@ -50,10 +50,10 @@ Every SPDX or CycloneDX document in the attestations is written. The attachment 
 
 - A Konflux SPDX statement uses predicate type `https://spdx.dev/Document`. The predicate is the SBOM.
 - An older OSBS attestation carries CycloneDX in `predicate.Data`.
-- SPDX and CycloneDX envelopes are verified with `redhat-sigstore.pub`. The script exits if at least one of those envelopes was checked and none verified.
+- SPDX and CycloneDX envelopes are verified with `redhat-sigstore.pub`, unless `--skip-verify-attestation` is set. The script warns if at least one of those envelopes was checked and none verified.
 - SLSA provenance (`https://slsa.dev/provenance/`) is stored under `att/` and skipped. Konflux Tekton Chains signs it with a different key.
 
-Example: `registry.redhat.io/openshift-gitops-1/gitops-operator-bundle:v1.21.3-1`
+Example: `registry.redhat.io/ubi9/ubi:9.8` with `--platform linux/amd64`. The amd64 manifest's attestations include an SPDX document, which is the SBOM, and SLSA provenance. `registry.redhat.io/openshift-gitops-1/gitops-operator-bundle:v1.21.3-1` is single-arch and publishes its SBOM as an SPDX attestation.
 
 ### SBOM attachment
 
@@ -61,9 +61,7 @@ Example: `registry.redhat.io/openshift-gitops-1/gitops-operator-bundle:v1.21.3-1
 
 The attachment has no in-toto signature. The script warns that the file was saved without signature verification.
 
-Example: `registry.redhat.io/ubi9/ubi:9.8`. Its `.att` tag is SLSA provenance only. With `--platform linux/amd64`, the attachment is the amd64 SPDX document (`text/spdx+json`).
-
-For a multi-arch image, `--platform` is passed to both downloads and selects that architecture, so the SBOM includes packages. Without `--platform`, the index SBOM lists the index and its per-architecture images. When cosign reports that the digest is not a multi-arch image, the download is retried without `--platform`.
+For a multi-arch image, `--platform` selects that architecture's manifest when the tag is resolved, so the SBOM is the one for that architecture. Downloads then use that digest. Because the digest is no longer an index, cosign is retried without `--platform`. Without `--platform`, resolution stays on the tag digest. When a single-arch image does not match `--platform`, resolution is retried without it.
 
 If the image has no attestations and no SBOM attachment, the script warns and exits successfully.
 
