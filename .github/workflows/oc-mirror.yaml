@@ -76,7 +76,7 @@ jobs:
         run: |
           cat oc-mirror-data/working-dir/dry-run/mapping.txt
           echo ""
-          ./download-from-mapping.sh --platform linux/amd64 --source registry.redhat.io --source quay.io --key /home/runner/redhat-sigstore.pub oc-mirror-data/working-dir/dry-run/mapping.txt
+          ./download-from-mapping.sh --source registry.redhat.io --source quay.io --key /home/runner/redhat-sigstore.pub oc-mirror-data/working-dir/dry-run/mapping.txt
 
       # Commented out due to amount of images, but below works
       #- name: oc-mirror

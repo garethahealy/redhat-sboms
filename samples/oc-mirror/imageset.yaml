@@ -8,4 +8,6 @@ mirror:
           channels:
             - name: stable-2.7
   additionalImages:
-    - name: registry.redhat.io/ubi9/ubi:latest
+    - name: registry.redhat.io/ubi9/ubi:9.8
+    - name: registry.redhat.io/ubi9/openjdk-21-runtime:1.24
+    - name: registry.redhat.io/openshift-gitops-1/gitops-rhel9-operator:1.21
