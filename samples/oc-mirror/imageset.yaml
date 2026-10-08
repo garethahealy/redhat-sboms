@@ -3,23 +3,11 @@ apiVersion: mirror.openshift.io/v2alpha1
 mirror:
   operators:
     - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.22
-      platforms:
-        - os: linux
-          architecture: amd64
       packages:
         - name: ansible-automation-platform-operator
           channels:
             - name: stable-2.7
   additionalImages:
     - name: registry.redhat.io/ubi9/ubi:9.8
-      platforms:
-        - os: linux
-          architecture: amd64
     - name: registry.redhat.io/ubi9/openjdk-21-runtime:1.24
-      platforms:
-        - os: linux
-          architecture: amd64
     - name: registry.redhat.io/openshift-gitops-1/gitops-rhel9-operator:1.21
-      platforms:
-        - os: linux
-          architecture: amd64
